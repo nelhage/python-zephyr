@@ -12,12 +12,7 @@ setup(
     author_email="broder@mit.edu",
     #url="http://ebroder.net/code/PyZephyr",
     license="MIT",
-    requires=['Cython'],
+    requires=['cffi'],
     py_modules=['zephyr'],
-    ext_modules=[
-        Extension("_zephyr",
-                  ["_zephyr.pyx", "pool.c"],
-                  libraries=["zephyr"])
-        ],
     cmdclass= {"build_ext": build_ext},
 )
