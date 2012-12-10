@@ -2,6 +2,7 @@ import os
 import pwd
 import time
 import select
+import weakref
 
 import cffi
 
@@ -85,9 +86,15 @@ Code_t ZGetSubscriptions(ZSubscription_t *, int *);
 int ZPending(void);
 char *ZGetSender(void);
 const char *ZGetRealm(void);
+Code_t ZSendNotice(ZNotice_t *, Z_AuthProc);
+Code_t ZFreeNotice(ZNotice_t *notice);
 
 Code_t ZReceiveNotice(ZNotice_t *notice, struct sockaddr_in *from);
 Code_t ZCheckAuthentication(ZNotice_t*, struct sockaddr_in*);
+
+static const Z_AuthProc ZAUTH;
+static const Z_AuthProc ZCAUTH;
+static const Z_AuthProc ZNOAUTH;
 
 /* com_err.h */
 
@@ -102,7 +109,7 @@ C = ffi.verify("""
 #include <com_err.h>
 """, libraries = ['zephyr', 'com_err'])
 
-def __error(errno):
+def check_errno(errno):
     if errno != 0:
         raise IOError(errno, ffi.string(C.error_message(errno)))
 
@@ -129,24 +136,35 @@ class ZUid(object):
         uid.time    = c_uid.tv.tv_sec + (c_uid.tv.tv_usec / 100000.0)
         return uid
 
+class ZephyrObjectMetadata(object):
+    def __init__(self, c_object):
+        self.c_object  = c_object
+        self.c_strings = {}
+
 class ZephyrObjectDecorator(object):
     def __init__(self, cls):
         self.decorated = cls
         self.c_type     = ffi.typeof(cls.__ctype__)
         self.c_ptr_type = ffi.getctype(self.c_type, "*")
+        self.mapping = weakref.WeakKeyDictionary()
+
+    def metadata(self, instance):
+        return self.mapping[instance]
 
     def init(self, inst, c_object):
-        inst.__dict__['__c_object'] = c_object or ffi.new(self.c_ptr_type)
-        inst.__dict__['__c_strings'] = {}
+        self.mapping[inst] = ZephyrObjectMetadata(c_object or ffi.new(self.c_ptr_type))
 
     def get(self, inst, attr):
-        return getattr(inst.__dict__['__c_object'], attr)
+        return getattr(self.metadata(inst).c_object, attr)
 
     def set(self, inst, attr, value):
+        meta = self.metadata(inst)
         if isinstance(value, str):
             value = ffi.new("char[]", value)
-            inst.__dict__['__c_strings'][attr] = value
-        setattr(inst.__dict__['__c_object'], attr, value)
+            meta.c_strings[attr] = value
+        elif value is None:
+            value = ffi.NULL
+        setattr(meta.c_object, attr, value)
 
 class ZephyrObjectType(type):
     def __init__(cls, name, bases, d):
@@ -165,6 +183,9 @@ class ZephyrObject(object):
 
     def __setattr__(self, attr, value):
         return self.__decorator__.set(self, attr, value)
+
+def unwrap(obj):
+    return type(obj).__decorator__.metadata(obj).c_object
 
 class CZUid(ZephyrObject):
     __ctype__ = 'ZUnique_Id_t'
@@ -213,16 +234,16 @@ class ZNotice(object):
         original_message = self.message
 
         if self.auth:
-            errno = C.ZSendNotice(c_notice.__c_object, C.ZAUTH)
+            errno = C.ZSendNotice(unwrap(c_notice), C.ZAUTH)
         else:
-            errno = C.ZSendNotice(c_notice.__c_object, C.ZNOAUTH)
-        __error(errno)
+            errno = C.ZSendNotice(unwrap(c_notice), C.ZNOAUTH)
+        check_errno(errno)
 
         self.load_from_c(c_notice)
 
         self.message = original_message
 
-        C.ZFreeNotice(c_notice.__c_object)
+        C.ZFreeNotice(unwrap(c_notice))
 
     def load_from_c(self, c_notice):
         self.kind = c_notice.z_kind
@@ -256,11 +277,11 @@ class ZNotice(object):
         c_notice = CZNotice()
 
         c_notice.z_kind = self.kind
-        c_notice.z_uid  = self.uid.to_c()
+        c_notice.z_uid  = self.uid.to_c()[0]
         if self.time != 0:
             c_notice.z_time.tv_sec = int(self.time)
             c_notice.z_time.tv_usec = int((self.time - c_notice.z_time.tv_sec) * 100000)
-        if notice.port != 0:
+        if self.port != 0:
             c_notice.z_port = self.port
         c_notice.z_auth = int(self.auth)
 
@@ -282,14 +303,16 @@ class ZNotice(object):
         c_notice.z_message = self.encoded_message
         c_notice.z_message_len = len(self.encoded_message)
 
+        return c_notice
+
 def initialize():
-    __error(C.ZInitialize())
+    check_errno(C.ZInitialize())
 
 def openPort():
     port = ffi.new('unsigned short *')
     port[0] = 0
 
-    __error(C.ZOpenPort(port))
+    check_errno(C.ZOpenPort(port))
 
     return int(port[0])
 
@@ -297,7 +320,7 @@ def getFD():
     return C.ZGetFD()
 
 def setFD(fd):
-    __error(C.ZSetFD(fd))
+    check_errno(C.ZSetFD(fd))
 
 def sub(cls, instance, recipient):
     newsub = CZSubscription()
@@ -306,7 +329,7 @@ def sub(cls, instance, recipient):
     newsub.zsub_classinst = instance
     newsub.zsub_recipient = recipient
 
-    __error(C.ZSubscribeTo(newsub.__c_object, 1, 0))
+    check_errno(C.ZSubscribeTo(unwrap(newsub), 1, 0))
 
 def subAll(lst):
     memory = ffi.new('ZSubscription_t[]', len(lst))
@@ -317,7 +340,7 @@ def subAll(lst):
         csubs[i].zsub_classinst = sub[1]
         csubs[i].zsub_recipient = sub[2]
 
-    __error(C.ZSubscribeTo(memory, len(lst), 0))
+    check_errno(C.ZSubscribeTo(memory, len(lst), 0))
 
 def unsub(cls, instance, recipient):
     delsub = CZSubscription()
@@ -326,10 +349,10 @@ def unsub(cls, instance, recipient):
     delsub.zsub_classinst = instance
     delsub.zsub_recipient = recipient
 
-    __error(C.ZUnsubscribeTo(delsub, 1, 0))
+    check_errno(C.ZUnsubscribeTo(delsub, 1, 0))
 
 def cancelSubs():
-    __error(C.ZCancelSubscriptions(0))
+    check_errno(C.ZCancelSubscriptions(0))
 
 def receive(block=False):
     while C.ZPending() == 0:
@@ -339,9 +362,9 @@ def receive(block=False):
 
     c_notice = CZNotice()
     sender = ffi.new('struct sockaddr_in *')
-    __error(C.ZReceiveNotice(c_notice.__c_object, sender))
+    check_errno(C.ZReceiveNotice(unwrap(c_notice), sender))
 
-    if C.ZCheckAuthentication(c_notice.__c_object, sender) == C.ZAUTH_YES:
+    if C.ZCheckAuthentication(unwrap(c_notice), sender) == C.ZAUTH_YES:
         c_notice.z_auth = 1
     else:
         c_notice.z_auth = 0
@@ -356,10 +379,10 @@ def realm():
 
 def getSubscriptions():
     c_num = ffi.new('int *')
-    __error(C.ZRetrieveSubscriptions(0, c_num))
+    check_errno(C.ZRetrieveSubscriptions(0, c_num))
 
     csubs = ffi.new("ZSubscription_t[]", int(c_num[0]))
-    __error(C.ZGetSubscriptions(csubs, c_num))
+    check_errno(C.ZGetSubscriptions(csubs, c_num))
 
     subs = [(ffi.string(csubs[i].zsub_class),
              ffi.string(csubs[i].zsub_classinst),
